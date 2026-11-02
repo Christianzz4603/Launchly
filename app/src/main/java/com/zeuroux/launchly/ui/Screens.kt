@@ -233,6 +233,10 @@ internal fun LibraryScreen(
         } else viewModel.download(id)
     }
 
+    val apkPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(viewModel::importApk)
+    }
+
     val installSettingsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         val operation = state.operation
         if (operation is PackageOperationState.PermissionRequired && context.packageManager.canRequestPackageInstalls()) {
@@ -266,6 +270,28 @@ internal fun LibraryScreen(
                                 }
                             }
                         ) { Text(stringResource(R.string.launch)) }
+                    }
+                }
+            }
+        }
+        item {
+            LaunchlyRaisedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(stringResource(R.string.import_apk_title), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(stringResource(R.string.import_apk_description), style = MaterialTheme.typography.bodyMedium, color = LaunchlyDesign.TextSecondary)
+                    LaunchlySecondaryButton(onClick = { apkPicker.launch(arrayOf("application/vnd.android.package-archive")) }) {
+                        Text(stringResource(R.string.import_apk))
+                    }
+                }
+            }
+        }
+        item {
+            LaunchlyRaisedCard(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(stringResource(R.string.community_content_title), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(stringResource(R.string.community_content_description), style = MaterialTheme.typography.bodyMedium, color = LaunchlyDesign.TextSecondary)
+                    LaunchlySecondaryButton(onClick = { openUrl(context, "https://mcpedl.org/") }) {
+                        Text(stringResource(R.string.open_mcpedl))
                     }
                 }
             }

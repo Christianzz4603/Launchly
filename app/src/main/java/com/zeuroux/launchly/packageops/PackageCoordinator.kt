@@ -36,6 +36,7 @@ import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import java.util.zip.ZipFile
 
 sealed interface PackageOperationState {
     data object Idle : PackageOperationState
@@ -61,6 +62,7 @@ interface PackageCoordinator {
     val installedPackage: StateFlow<InstalledPackage?>
     val operation: StateFlow<PackageOperationState>
     fun refreshInstalledPackage()
+    suspend fun importApk(uri: Uri)
     suspend fun install(versionId: String)
     suspend fun confirmDowngrade(versionId: String)
     suspend fun dismissOperation()
@@ -81,6 +83,8 @@ class AckpinePackageCoordinator(
     private val _installedPackage = MutableStateFlow<InstalledPackage?>(null)
     override val installedPackage: StateFlow<InstalledPackage?> = _installedPackage.asStateFlow()
     private val _operation = MutableStateFlow<PackageOperationState>(PackageOperationState.Idle)
+    private data class ImportedApk(val file: File, val versionCode: Long, val versionName: String, val architecture: Architecture)
+    private val importedApks = mutableMapOf<String, ImportedApk>()
     override val operation: StateFlow<PackageOperationState> = _operation.asStateFlow()
 
     private val packageReceiver = object : BroadcastReceiver() {
@@ -109,11 +113,59 @@ class AckpinePackageCoordinator(
         }
     }
 
+    override suspend fun importApk(uri: Uri) {
+        if (_operation.value is PackageOperationState.Preparing || _operation.value is PackageOperationState.Installing ||
+            _operation.value is PackageOperationState.Uninstalling) return
+        val id = "import-${UUID.randomUUID()}"
+        _operation.value = PackageOperationState.Preparing(id)
+        try {
+            val imported = withContext(Dispatchers.IO) {
+                val directory = File(context.filesDir, "imports/$id").apply { mkdirs() }
+                val apk = File(directory, "base.apk")
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    apk.outputStream().use { output ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        var total = 0L
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            total += count
+                            if (total > 1024L * 1024L * 1024L) throw ApkValidationException("The selected APK is larger than 1 GB.")
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                } ?: throw ApkValidationException("The selected APK could not be opened.")
+                if (!apk.isFile || apk.length() == 0L) throw ApkValidationException("The selected APK is empty.")
+                val info = context.packageManager.getPackageArchiveInfo(apk.absolutePath, PackageManager.GET_SIGNING_CERTIFICATES)
+                    ?: throw ApkValidationException("The selected file is not a valid Android APK.")
+                if (info.packageName != MINECRAFT_PACKAGE) throw ApkValidationException("This APK is not the Minecraft package.")
+                val abis = ZipFile(apk).use { zip ->
+                    zip.entries().asSequence().map { it.name }.filter { it.startsWith("lib/") }
+                        .mapNotNull { it.split('/').getOrNull(1) }.toSet()
+                }
+                val architecture = if (abis.isEmpty()) Architecture.UNKNOWN else
+                    Architecture.compatibleDeviceArchitectures().firstOrNull { it.abi in abis }
+                        ?: throw ApkValidationException("This APK does not contain native libraries for this device.")
+                ImportedApk(apk, info.longVersionCode, info.versionName ?: info.longVersionCode.toString(), architecture)
+            }
+            val installed = installedPackage.value
+            if (installed != null && imported.versionCode < installed.versionCode) {
+                throw ApkValidationException("This APK is older than the installed Minecraft version. Downgrading may require uninstalling Minecraft and can erase its data.")
+            }
+            validator.validate(listOf(imported.file), imported.versionCode, imported.architecture)
+            importedApks[id] = imported
+            installImportedInternal(id)
+        } catch (error: Exception) {
+            _operation.value = PackageOperationState.Failure(error.message ?: "The APK could not be imported.")
+        }
+    }
+
     override suspend fun install(versionId: String) {
         if (_operation.value is PackageOperationState.Preparing ||
             _operation.value is PackageOperationState.Installing ||
             _operation.value is PackageOperationState.Uninstalling
         ) return
+        if (importedApks.containsKey(versionId)) { installImportedInternal(versionId); return }
         _operation.value = PackageOperationState.Preparing(versionId)
         val target = managedVersions.get(versionId)
             ?: return fail("The managed version no longer exists.")
@@ -154,6 +206,26 @@ class AckpinePackageCoordinator(
             context.startActivity(intent)
             LaunchResult.Launched
         }.getOrElse { LaunchResult.Failure("Minecraft could not be opened on this device.") }
+    }
+
+    private suspend fun installImportedInternal(id: String) {
+        val imported = importedApks[id] ?: return fail("The imported APK is no longer available. Import it again.")
+        if (!context.packageManager.canRequestPackageInstalls()) {
+            _operation.value = PackageOperationState.PermissionRequired(id)
+            return
+        }
+        _operation.value = PackageOperationState.Preparing(id)
+        runCatching { validator.validate(listOf(imported.file), imported.versionCode, imported.architecture) }
+            .onFailure { return fail(it.message ?: "APK verification failed.") }
+        val session = installer.createSession(
+            InstallParameters.Builder(listOf(Uri.fromFile(imported.file)))
+                .setConfirmation(Confirmation.IMMEDIATE)
+                .setInstallerType(InstallerType.SESSION_BASED)
+                .setName("Minecraft ${imported.versionName} (imported)")
+                .build()
+        )
+        attachInstallerSession(session, id)
+        _operation.value = PackageOperationState.Installing(id, null)
     }
 
     private suspend fun installInternal(versionId: String) {
@@ -222,6 +294,7 @@ class AckpinePackageCoordinator(
                 applicationScope.launch {
                     preferences.setInstallerSession(null, null)
                     refreshInstalledPackage()
+                    importedApks.remove(versionId)?.file?.parentFile?.deleteRecursively()
                     _operation.value = PackageOperationState.Completed("Minecraft installation finished.")
                 }
             }

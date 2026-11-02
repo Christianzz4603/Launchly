@@ -87,6 +87,7 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LibraryUiState())
 
     fun download(id: String) = viewModelScope.launch { container.downloads.enqueue(id) }
+    fun importApk(uri: Uri) = viewModelScope.launch { container.packages.importApk(uri) }
     fun install(id: String) = viewModelScope.launch { container.packages.install(id) }
     fun confirmDowngrade(id: String) = viewModelScope.launch { container.packages.confirmDowngrade(id) }
     fun delete(id: String) = viewModelScope.launch { container.downloads.delete(id) }
